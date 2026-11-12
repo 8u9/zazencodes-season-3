@@ -22,14 +22,15 @@ original factory stops at its first step there.
 
 ## What an approved job looks like
 
-The PR is ready for review, a comment says the factory approved it, and the
-issue carries `factory:needs-human`. Merge the PR on GitHub. The next
+The PR is ready for review, a comment headed "Factory: approved, ready to merge"
+carries the approver's decision, and the issue carries `factory:needs-human`. Merge the PR on GitHub. The next
 `/factory run` sees the merge and marks the job done.
 
 ## Limits
 
 - Marking a draft PR ready uses a route that exists only in cloud sessions. On
   a laptop set `github_transport` to `gh`.
-- Not yet run end to end on a real issue. The GitHub layer was tested against a
-  real repository: reading issues and pull requests, and adding and removing a
-  label.
+- Run end to end on a real issue in a cloud session, through both endings: an
+  escalation, and an approval left for a person to merge.
+- The cost column reads $0.00 in a cloud session: the transcripts the cost is
+  read from are not where the script looks for them.
