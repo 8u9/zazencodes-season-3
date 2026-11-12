@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""ghx: the subset of `gh` the factory uses, with a choice of transport.
+
+`gh issue ...` and `gh pr ...` talk to GitHub's GraphQL API, which Claude Code
+cloud sessions don't allow. This wrapper accepts the same commands and, when
+`github_transport` in factory/config.json is "rest" (the default here), answers
+them through the REST API with `gh api`. With "gh" it hands the command to
+`gh` unchanged, so the same factory runs on a laptop too.
+
+Supported: api (passed through), issue view|list|comment|edit|create,
+pr view|list|create|ready|close|merge|comment|edit. Output matches `gh`'s for
+the fields the factory reads.
+"""
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+CONFIG = json.loads((BIN.parent / "config.json").read_text())
+TRANSPORT = CONFIG.get("github_transport", "rest")
+
+
+def die(msg, code=1):
+    print(f"ghx: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def gh_api(method, path, fields=None, paginate=False, check=True):
+    cmd = ["gh", "api", "-X", method, path]
+    if paginate:
+        cmd.append("--paginate")
+    stdin = None
+    if fields is not None:
+        cmd += ["--input", "-"]
+        stdin = json.dumps(fields)
+    res = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
+    if res.returncode != 0:
+        if check:
+            die((res.stderr or res.stdout).strip(), res.returncode)
+        return None
+    out = res.stdout.strip()
+    if not out:
+        return {}
+    if paginate:
+        # --paginate concatenates JSON arrays: "[...][...]".
+        merged, dec, i = [], json.JSONDecoder(), 0
+        while i < len(out):
+            obj, i = dec.raw_decode(out, i)
+            merged += obj if isinstance(obj, list) else [obj]
+            while i < len(out) and out[i].isspace():
+                i += 1
+        return merged
+    return json.loads(out)
+
+
+_repo = None
+
+
+def repo():
+    """owner/name from the origin remote."""
+    global _repo
+    if _repo is None:
+        url = subprocess.run(["git", "remote", "get-url", "origin"],
+                             capture_output=True, text=True).stdout.strip()
+        m = re.search(r"[:/]([^/:]+)/([^/]+?)(?:\.git)?/?$", url)
+        if not m:
+            die(f"can't read owner/repo from origin ({url!r})")
+        _repo = f"{m.group(1)}/{m.group(2)}"
+    return _repo
+
+
+def flags(args, spec):
+    """Parse `--name value` and bare `--name` flags. spec: {name: takes_value}."""
+    out, rest, i = {}, [], 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--") and a[2:] in spec:
+            if spec[a[2:]]:
+                if i + 1 >= len(args):
+                    die(f"{a} needs a value")
+                out[a[2:]] = args[i + 1]
+                i += 2
+            else:
+                out[a[2:]] = True
+                i += 1
+        else:
+            rest.append(a)
+            i += 1
+    return out, rest
+
+
+def pick(obj, fields):
+    return {k: obj[k] for k in fields.split(",")} if fields else obj
+
+
+def emit(obj, fields):
+    print(json.dumps(pick(obj, fields)))
+
+
+# ---- issues -----------------------------------------------------------------
+
+
+def issue_obj(raw, comments=None):
+    return {
+        "number": raw["number"],
+        "title": raw["title"],
+        "body": raw.get("body") or "",
+        "author": {"login": raw["user"]["login"]},
+        "labels": [{"name": l["name"]} for l in raw.get("labels", [])],
+        "state": raw["state"].upper(),
+        "url": raw["html_url"],
+        "comments": [
+            {"author": {"login": c["user"]["login"]}, "body": c.get("body") or "",
+             "createdAt": c["created_at"]}
+            for c in (comments or [])
+        ],
+    }
+
+
+def issue_view(args):
+    f, rest = flags(args, {"json": True})
+    n = rest[0]
+    raw = gh_api("GET", f"repos/{repo()}/issues/{n}")
+    comments = gh_api("GET", f"repos/{repo()}/issues/{n}/comments?per_page=100", paginate=True)
+    emit(issue_obj(raw, comments), f.get("json"))
+
+
+def issue_list(args):
+    f, _ = flags(args, {"label": True, "state": True, "limit": True, "json": True})
+    q = f"repos/{repo()}/issues?state={f.get('state', 'open')}&per_page=100"
+    if f.get("label"):
+        q += f"&labels={f['label']}"
+    rows = [r for r in gh_api("GET", q, paginate=True) if "pull_request" not in r]
+    rows = rows[: int(f.get("limit", 30))]
+    print(json.dumps([pick(issue_obj(r), f.get("json")) for r in rows]))
+
+
+def comment(args):
+    f, rest = flags(args, {"body": True})
+    gh_api("POST", f"repos/{repo()}/issues/{rest[0]}/comments", {"body": f["body"]})
+
+
+def edit(args):
+    f, rest = flags(args, {"add-label": True, "remove-label": True})
+    n = rest[0]
+    if f.get("add-label"):
+        gh_api("POST", f"repos/{repo()}/issues/{n}/labels",
+               {"labels": [l for l in f["add-label"].split(",") if l]})
+    for name in (f.get("remove-label") or "").split(","):
+        if name:  # a label that isn't on the issue is not an error
+            gh_api("DELETE", f"repos/{repo()}/issues/{n}/labels/{name}", check=False)
+
+
+def issue_create(args):
+    f, _ = flags(args, {"label": True, "title": True, "body": True})
+    raw = gh_api("POST", f"repos/{repo()}/issues", {
+        "title": f["title"], "body": f.get("body", ""),
+        "labels": [l for l in (f.get("label") or "").split(",") if l]})
+    print(raw["html_url"])
+
+
+# ---- pull requests ----------------------------------------------------------
+
+
+def pr_obj(raw):
+    state = "MERGED" if raw.get("merged_at") else raw["state"].upper()
+    return {"number": raw["number"], "url": raw["html_url"], "state": state,
+            "isDraft": bool(raw.get("draft")), "title": raw["title"],
+            "headRefName": raw["head"]["ref"], "baseRefName": raw["base"]["ref"]}
+
+
+def pr_find(ref):
+    """A PR by number, or the newest PR whose head is the branch `ref`."""
+    if str(ref).isdigit():
+        return gh_api("GET", f"repos/{repo()}/pulls/{ref}")
+    owner = repo().split("/")[0]
+    rows = gh_api("GET", f"repos/{repo()}/pulls?head={owner}:{ref}&state=all&per_page=100")
+    if not rows:
+        die(f"no pull request found for branch {ref!r}")
+    return rows[0]
+
+
+def pr_view(args):
+    f, rest = flags(args, {"json": True})
+    obj = pr_obj(pr_find(rest[0]))
+    if f.get("json"):
+        emit(obj, f["json"])
+    else:
+        print(obj["url"])
+
+
+def pr_list(args):
+    f, _ = flags(args, {"head": True, "state": True, "json": True})
+    q = f"repos/{repo()}/pulls?state={f.get('state', 'open')}&per_page=100"
+    if f.get("head"):
+        q += f"&head={repo().split('/')[0]}:{f['head']}"
+    print(json.dumps([pick(pr_obj(r), f.get("json")) for r in gh_api("GET", q)]))
+
+
+def pr_create(args):
+    f, _ = flags(args, {"draft": False, "base": True, "head": True, "title": True, "body": True})
+    raw = gh_api("POST", f"repos/{repo()}/pulls", {
+        "title": f["title"], "head": f["head"], "base": f["base"],
+        "body": f.get("body", ""), "draft": bool(f.get("draft"))})
+    print(raw["html_url"])
+
+
+def pr_ready(args):
+    n = pr_find(args[0])["number"]
+    # Marking ready has no public REST endpoint. Cloud sessions expose a route
+    # for it; anywhere else, use the "gh" transport.
+    if gh_api("POST", f"repos/{repo()}/pulls/{n}/ccr/ready_for_review", check=False) is None:
+        die("can't mark the PR ready over REST here; set github_transport to \"gh\"")
+
+
+def pr_close(args):
+    gh_api("PATCH", f"repos/{repo()}/pulls/{pr_find(args[0])['number']}", {"state": "closed"})
+
+
+def pr_merge(args):
+    f, rest = flags(args, {"merge": False, "squash": False, "rebase": False})
+    method = next((m for m in ("merge", "squash", "rebase") if f.get(m)), "merge")
+    gh_api("PUT", f"repos/{repo()}/pulls/{pr_find(rest[0])['number']}/merge",
+           {"merge_method": method})
+
+
+COMMANDS = {
+    ("issue", "view"): issue_view, ("issue", "list"): issue_list,
+    ("issue", "comment"): comment, ("issue", "edit"): edit,
+    ("issue", "create"): issue_create,
+    ("pr", "view"): pr_view, ("pr", "list"): pr_list, ("pr", "create"): pr_create,
+    ("pr", "ready"): pr_ready, ("pr", "close"): pr_close, ("pr", "merge"): pr_merge,
+    ("pr", "comment"): comment, ("pr", "edit"): edit,
+}
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        die(__doc__.strip(), 2)
+    if TRANSPORT == "gh" or args[0] == "api":
+        sys.exit(subprocess.run(["gh", *args]).returncode)
+    fn = COMMANDS.get(tuple(args[:2]))
+    if not fn:
+        die(f"`{' '.join(args[:2])}` isn't supported over REST; see the list in this file")
+    fn(args[2:])
+
+
+if __name__ == "__main__":
+    main()
