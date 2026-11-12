@@ -489,7 +489,11 @@ def advance(job, stage):
         label("issue", job["issue"], remove=LABELS["needs_human"])
 
     if stage == "needs-human":
-        body = f"### Factory: needs a human\n\n{(d / 'decision.md').read_text().split(chr(10), 1)[1].strip()}"
+        decision = (d / "decision.md").read_text()
+        # With auto_merge off, an approved job also waits here, for a person to merge it.
+        heading = ("### Factory: approved, ready to merge" if decision.startswith("APPROVE")
+                   else "### Factory: needs a human")
+        body = f"{heading}\n\n{decision.split(chr(10), 1)[1].strip()}"
         if job["pr"]:
             if gh_json("pr", "view", str(job["pr"]), "--json", "isDraft")["isDraft"]:
                 gh("pr", "ready", str(job["pr"]))
@@ -625,8 +629,10 @@ def cmd_merge(job):
         if not CONFIG.get("auto_merge", True):
             # The factory stops here: the PR is approved, synced, gated and ready,
             # and a person merges it. The queue marks the job merged once they do.
-            return fail("Approved by the factory: every check and review passed, the branch is "
-                        f"synced with {BASE} and the gate passed again. Merge the PR to finish.")
+            # decision.md keeps the approver's APPROVE and its reasons.
+            save(advance(sync(job), "needs-human"))
+            print(f"{job['id']}: approved, PR #{job['pr']} is ready for a person to merge")
+            return
         gh("pr", "merge", str(job["pr"]), f"--{CONFIG['merge_method']}")
     except Refused as e:
         return fail(f"The merge failed:\n\n```\n{e}\n```")
