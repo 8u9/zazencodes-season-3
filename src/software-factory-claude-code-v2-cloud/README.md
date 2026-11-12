@@ -1,4 +1,7 @@
-# Software Factory for Claude Code (v2)
+# Software Factory for Claude Code (v2, cloud variant)
+
+> This folder is a variant that runs inside a Claude Code cloud session. What
+> changed from the original, and why, is in [`CLOUD.md`](CLOUD.md).
 
 A software factory that works through your GitHub issues. Label an issue
 `factory`, run `/factory run`, and agents decide whether it's worth building,
@@ -13,7 +16,7 @@ Open Claude Code in your project and paste:
 ```text
 Install this software factory in this project from the reference repository:
 
-https://github.com/zazencodes/zazencodes-season-3/tree/main/src/software-factory-claude-code-v2
+https://github.com/8u9/zazencodes-season-3/tree/main/src/software-factory-claude-code-v2-cloud
 ```
 
 Your agent reads [`INSTALL.md`](INSTALL.md), copies the skill, agents, scripts
@@ -48,7 +51,7 @@ approver (opus) ── APPROVE  → sync with main, gate again, gh pr merge
 ```
 
 One Claude Code session orchestrates every job, `concurrency` at a time
-(default 3). Each job gets its own git worktree and branch. All state lives in
+(default 1 in this cloud variant). Each job gets its own git worktree and branch. All state lives in
 `factory/jobs/`, so if the session dies, `/factory run` picks every job back up.
 
 ## Commands
@@ -101,6 +104,7 @@ factory/
   bin/job                     the only writer of job.json; refuses illegal moves; merges
   bin/gate                    runs checks.sh in a job's worktree → round-N/checks.md
   bin/route                   risk + surfaces → the job's reviewers and models
+  bin/ghx                     the `gh` commands the factory uses, over REST or handed to `gh`
   dashboard.html              the board
 examples/jobs/                finished jobs from a real run
 INSTALL.md                    instructions for the installing agent
