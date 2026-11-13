@@ -41,6 +41,7 @@ factory/bin/job
 factory/bin/gate
 factory/bin/route
 factory/bin/ghx
+factory/bin/glx
 factory/dashboard.html
 ```
 
@@ -49,7 +50,7 @@ SRC=https://raw.githubusercontent.com/8u9/zazencodes-season-3/main/src/software-
 for f in <the paths above>; do
   mkdir -p "$(dirname "$f")" && curl -fsSL "$SRC/$f" -o "$f"
 done
-chmod +x factory/checks.sh factory/bin/job factory/bin/gate factory/bin/route factory/bin/ghx
+chmod +x factory/checks.sh factory/bin/job factory/bin/gate factory/bin/route factory/bin/ghx factory/bin/glx
 ```
 
 Don't copy `README.md`, `DESIGN.md`, `INSTALL.md`, `LICENSE`, `examples/` or
@@ -78,7 +79,8 @@ It must be non-interactive, must not rewrite files (no `--fix`, no
   Add a path only when no job should ever change it. They are fnmatch
   patterns, so `*` also matches `/`.
 - `github_transport`: `rest` in a Claude Code cloud session (GraphQL is not
-  available there), `gh` on a laptop if you prefer the stock CLI.
+  available there), `gh` on a laptop if you prefer the stock CLI, `gitlab` when
+  the repo lives on a GitLab server (issues and merge requests; see "GitLab" below).
 - `auto_merge`: `false` leaves every approved PR for a person to merge; `true`
   restores the original behaviour. Keep it `false` in a cloud session.
 - `ports`: move `base` if the project already uses ports 5100–5199.
@@ -175,3 +177,30 @@ Then tell the user, in a few lines:
   bill to usage credits rather than the plan's included usage.
 - To start carefully, set `concurrency` to 1 in `factory/config.json` and read
   every PR until they trust it.
+
+## GitLab
+
+With `"github_transport": "gitlab"`, `ghx` hands every command to `factory/bin/glx`,
+which answers from the GitLab REST API (v4). The factory itself doesn't change: an
+issue is an issue and a pull request is a merge request.
+
+Settings. The token never goes in `config.json`:
+
+- `GITLAB_TOKEN` (environment): a project or personal access token with the `api` scope.
+  Give it the Developer role on the one project, not more.
+- `GITLAB_URL` (environment) or `gitlab_url` (config): e.g. `https://gitlab.example.com`.
+- `GITLAB_PROJECT` (environment) or `gitlab_project` (config): `group/subgroup/project`.
+  By default it's read from the `origin` remote.
+
+Differences to know:
+
+- A draft merge request is a title that starts with `Draft:`. `ready` removes the prefix.
+- `merge_method`: `merge` or `squash`. `rebase` is refused, because GitLab merges with
+  the project's own method (Settings → Merge requests).
+- Merging fails, and the factory reports it, if the project requires a green pipeline or
+  approvals that aren't there yet. Decide those rules in GitLab; the factory doesn't bypass them.
+- Not covered: GitHub-specific checks such as reading CI results before merging. If your
+  copy of the factory has them, they need a GitLab equivalent (pipelines API).
+
+Tests: `python3 -m unittest discover -s factory/tests`. They run `glx` against a fake
+GitLab server; a real server still needs one end-to-end run before you trust it.

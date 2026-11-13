@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""glx: the subset of `gh` the factory uses, answered by a GitLab server.
+
+`ghx` hands every command here when `github_transport` in factory/config.json is
+"gitlab". The commands, flags and JSON output are the ones `ghx` gives, so
+factory/bin/job doesn't change: an issue is an issue, a pull request is a merge request.
+
+Settings (never the token in config.json):
+  GITLAB_TOKEN        personal or project access token, scope `api`   (env, required)
+  GITLAB_URL          e.g. https://gitlab.example.com                  (env, or "gitlab_url")
+  gitlab_project      "group/subgroup/project"   (env GITLAB_PROJECT or config; default: from `origin`)
+
+Supported: api user --jq .login, issue view|list|comment|edit|create,
+pr view|list|create|ready|close|merge|comment|edit.
+Not supported: `pr merge --rebase` (GitLab merges with the project's own method).
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+CONFIG = json.loads((BIN.parent / "config.json").read_text())
+
+
+def die(msg, code=1):
+    print(f"glx: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def base_url():
+    url = os.environ.get("GITLAB_URL") or CONFIG.get("gitlab_url")
+    if not url:
+        die("set GITLAB_URL (or gitlab_url in factory/config.json)")
+    return url.rstrip("/")
+
+
+def token():
+    t = os.environ.get("GITLAB_TOKEN")
+    if not t:
+        die("set GITLAB_TOKEN (a token with the `api` scope)")
+    return t
+
+
+def request(method, path, fields=None, paginate=False, check=True):
+    """Call /api/v4/<path>. With paginate, follow X-Next-Page and merge the lists."""
+    results, page = [], 1
+    while True:
+        sep = "&" if "?" in path else "?"
+        url = f"{base_url()}/api/v4/{path}" + (f"{sep}page={page}" if paginate else "")
+        data = json.dumps(fields).encode() if fields is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("PRIVATE-TOKEN", token())
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = resp.read().decode()
+                nxt = resp.headers.get("X-Next-Page", "")
+        except urllib.error.HTTPError as e:
+            if not check:
+                return None
+            detail = e.read().decode(errors="replace")[:300]
+            die(f"{method} {path}: HTTP {e.code} {detail}")
+        except urllib.error.URLError as e:
+            die(f"{method} {path}: {e.reason}")
+        obj = json.loads(body) if body.strip() else {}
+        if not paginate:
+            return obj
+        results += obj if isinstance(obj, list) else [obj]
+        if not nxt:
+            return results
+        page = int(nxt)
+
+
+_project = None
+
+
+def project():
+    """URL-encoded project path: config `gitlab_project`, else from the origin remote."""
+    global _project
+    if _project is None:
+        path = os.environ.get("GITLAB_PROJECT") or CONFIG.get("gitlab_project")
+        if not path:
+            url = subprocess.run(["git", "remote", "get-url", "origin"],
+                                 capture_output=True, text=True).stdout.strip()
+            m = re.match(r"^(?:[a-z+]+://(?:[^@/]+@)?[^/]+/|[^@/]+@[^:]+:)(.+?)(?:\.git)?/?$", url)
+            if not m:
+                die(f"can't read the project path from origin ({url!r}); set gitlab_project")
+            path = m.group(1)
+        _project = urllib.parse.quote(path, safe="")
+    return _project
+
+
+def flags(args, spec):
+    out, rest, i = {}, [], 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--") and a[2:] in spec:
+            if spec[a[2:]]:
+                if i + 1 >= len(args):
+                    die(f"{a} needs a value")
+                out[a[2:]] = args[i + 1]
+                i += 2
+            else:
+                out[a[2:]] = True
+                i += 1
+        else:
+            rest.append(a)
+            i += 1
+    return out, rest
+
+
+def pick(obj, fields):
+    return {k: obj[k] for k in fields.split(",")} if fields else obj
+
+
+def emit(obj, fields):
+    print(json.dumps(pick(obj, fields)))
+
+
+STATE_IN = {"open": "opened", "opened": "opened", "closed": "closed", "merged": "merged", "all": "all"}
+
+
+def q(**params):
+    return urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+
+
+# ---- issues -----------------------------------------------------------------
+
+
+def issue_obj(raw, notes=None):
+    return {
+        "number": raw["iid"],
+        "title": raw["title"],
+        "body": raw.get("description") or "",
+        "author": {"login": raw["author"]["username"]},
+        "labels": [{"name": name} for name in raw.get("labels", [])],
+        "state": "OPEN" if raw["state"] == "opened" else raw["state"].upper(),
+        "url": raw["web_url"],
+        "comments": [
+            {"author": {"login": n["author"]["username"]}, "body": n.get("body") or "",
+             "createdAt": n["created_at"]}
+            for n in (notes or []) if not n.get("system")
+        ],
+    }
+
+
+def issue_view(args):
+    f, rest = flags(args, {"json": True})
+    n = rest[0]
+    raw = request("GET", f"projects/{project()}/issues/{n}")
+    notes = request("GET", f"projects/{project()}/issues/{n}/notes?" + q(sort="asc", per_page=100),
+                    paginate=True)
+    emit(issue_obj(raw, notes), f.get("json"))
+
+
+def issue_list(args):
+    f, _ = flags(args, {"label": True, "state": True, "limit": True, "json": True})
+    query = q(state=STATE_IN.get(f.get("state", "open"), "opened"), labels=f.get("label"), per_page=100)
+    rows = request("GET", f"projects/{project()}/issues?{query}", paginate=True)
+    rows = rows[: int(f.get("limit", 30))]
+    print(json.dumps([pick(issue_obj(r), f.get("json")) for r in rows]))
+
+
+def issue_create(args):
+    f, _ = flags(args, {"label": True, "title": True, "body": True})
+    raw = request("POST", f"projects/{project()}/issues", {
+        "title": f["title"], "description": f.get("body", ""), "labels": f.get("label", "")})
+    print(raw["web_url"])
+
+
+# ---- merge requests ---------------------------------------------------------
+
+DRAFT = re.compile(r"^\s*(?:\[draft\]|\(draft\)|draft:)\s*", re.I)
+
+
+def pr_obj(raw):
+    state = {"opened": "OPEN", "merged": "MERGED", "closed": "CLOSED", "locked": "CLOSED"}[raw["state"]]
+    draft = raw.get("draft", raw.get("work_in_progress", False))
+    return {"number": raw["iid"], "url": raw["web_url"], "state": state,
+            "isDraft": bool(draft), "title": raw["title"],
+            "headRefName": raw["source_branch"], "baseRefName": raw["target_branch"]}
+
+
+def pr_find(ref):
+    """A merge request by IID, or the newest one whose source branch is `ref`."""
+    if str(ref).isdigit():
+        return request("GET", f"projects/{project()}/merge_requests/{ref}")
+    rows = request("GET", f"projects/{project()}/merge_requests?" +
+                   q(source_branch=ref, state="all", order_by="created_at", sort="desc", per_page=100))
+    if not rows:
+        die(f"no merge request found for branch {ref!r}")
+    return rows[0]
+
+
+def pr_view(args):
+    f, rest = flags(args, {"json": True})
+    obj = pr_obj(pr_find(rest[0]))
+    if f.get("json"):
+        emit(obj, f["json"])
+    else:
+        print(obj["url"])
+
+
+def pr_list(args):
+    f, _ = flags(args, {"head": True, "state": True, "json": True})
+    query = q(state=STATE_IN.get(f.get("state", "open"), "opened"), source_branch=f.get("head"), per_page=100)
+    rows = request("GET", f"projects/{project()}/merge_requests?{query}", paginate=True)
+    print(json.dumps([pick(pr_obj(r), f.get("json")) for r in rows]))
+
+
+def pr_create(args):
+    f, _ = flags(args, {"draft": False, "base": True, "head": True, "title": True, "body": True})
+    title = f["title"]
+    if f.get("draft") and not DRAFT.match(title):
+        title = f"Draft: {title}"
+    raw = request("POST", f"projects/{project()}/merge_requests", {
+        "title": title, "source_branch": f["head"], "target_branch": f["base"],
+        "description": f.get("body", "")})
+    print(raw["web_url"])
+
+
+def pr_ready(args):
+    mr = pr_find(args[0])
+    request("PUT", f"projects/{project()}/merge_requests/{mr['iid']}", {"title": DRAFT.sub("", mr["title"])})
+
+
+def pr_close(args):
+    request("PUT", f"projects/{project()}/merge_requests/{pr_find(args[0])['iid']}", {"state_event": "close"})
+
+
+def pr_merge(args):
+    f, rest = flags(args, {"merge": False, "squash": False, "rebase": False})
+    if f.get("rebase"):
+        die("`pr merge --rebase` isn't supported on GitLab: set merge_method to merge or squash")
+    mr = pr_find(rest[0])
+    if pr_obj(mr)["isDraft"]:
+        die(f"merge request !{mr['iid']} is still a draft")
+    request("PUT", f"projects/{project()}/merge_requests/{mr['iid']}/merge",
+            {"squash": bool(f.get("squash"))})
+
+
+# ---- notes and labels (issues and merge requests) ---------------------------
+
+
+def kind_path(kind, n):
+    return f"projects/{project()}/{'issues' if kind == 'issue' else 'merge_requests'}/{n}"
+
+
+def comment(kind, args):
+    f, rest = flags(args, {"body": True})
+    request("POST", f"{kind_path(kind, rest[0])}/notes", {"body": f["body"]})
+
+
+def edit(kind, args):
+    f, rest = flags(args, {"add-label": True, "remove-label": True})
+    fields = {}
+    if f.get("add-label"):
+        fields["add_labels"] = f["add-label"]
+    if f.get("remove-label"):  # a label that isn't on the issue is not an error
+        fields["remove_labels"] = f["remove-label"]
+    if fields:
+        request("PUT", kind_path(kind, rest[0]), fields)
+
+
+def api(args):
+    """Only what the factory asks of `api`: the current user's login."""
+    if args[:1] == ["user"] and "--jq" in args and args[args.index("--jq") + 1] == ".login":
+        print(request("GET", "user")["username"])
+        return
+    die("`api` is only supported as: api user --jq .login")
+
+
+COMMANDS = {
+    ("issue", "view"): issue_view, ("issue", "list"): issue_list, ("issue", "create"): issue_create,
+    ("issue", "comment"): lambda a: comment("issue", a), ("issue", "edit"): lambda a: edit("issue", a),
+    ("pr", "view"): pr_view, ("pr", "list"): pr_list, ("pr", "create"): pr_create,
+    ("pr", "ready"): pr_ready, ("pr", "close"): pr_close, ("pr", "merge"): pr_merge,
+    ("pr", "comment"): lambda a: comment("pr", a), ("pr", "edit"): lambda a: edit("pr", a),
+}
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        die(__doc__.strip(), 2)
+    if args[0] == "api":
+        return api(args[1:])
+    fn = COMMANDS.get(tuple(args[:2]))
+    if not fn:
+        die(f"`{' '.join(args[:2])}` isn't supported on GitLab; see the list in this file")
+    fn(args[2:])
+
+
+if __name__ == "__main__":
+    main()
