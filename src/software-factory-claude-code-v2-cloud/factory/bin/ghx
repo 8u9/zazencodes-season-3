@@ -5,13 +5,15 @@
 cloud sessions don't allow. This wrapper accepts the same commands and, when
 `github_transport` in factory/config.json is "rest" (the default here), answers
 them through the REST API with `gh api`. With "gh" it hands the command to
-`gh` unchanged, so the same factory runs on a laptop too.
+`gh` unchanged, so the same factory runs on a laptop too. With "gitlab" it hands
+them to `glx`, which answers from a GitLab server (issues and merge requests).
 
 Supported: api (passed through), issue view|list|comment|edit|create,
 pr view|list|create|ready|close|merge|comment|edit. Output matches `gh`'s for
 the fields the factory reads.
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -19,7 +21,7 @@ from pathlib import Path
 
 BIN = Path(__file__).resolve().parent
 CONFIG = json.loads((BIN.parent / "config.json").read_text())
-TRANSPORT = CONFIG.get("github_transport", "rest")
+TRANSPORT = os.environ.get("GHX_TRANSPORT") or CONFIG.get("github_transport", "rest")
 
 
 def die(msg, code=1):
@@ -240,6 +242,9 @@ def main():
     args = sys.argv[1:]
     if not args:
         die(__doc__.strip(), 2)
+    if TRANSPORT == "gitlab":
+        # Same commands, answered by a GitLab server: see factory/bin/glx.
+        os.execv(sys.executable, [sys.executable, str(BIN / "glx"), *args])
     if TRANSPORT == "gh" or args[0] == "api":
         sys.exit(subprocess.run(["gh", *args]).returncode)
     fn = COMMANDS.get(tuple(args[:2]))

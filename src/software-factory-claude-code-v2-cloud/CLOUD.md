@@ -15,6 +15,7 @@ original factory stops at its first step there.
 | File | Change |
 |---|---|
 | `factory/bin/ghx` | New. Accepts the `gh` commands the factory uses and answers them over REST (`gh api`), or hands them to `gh` unchanged. |
+| `factory/bin/glx` | New. Same commands as `ghx`, answered by a GitLab server, used when `github_transport` is `gitlab`. |
 | `factory/bin/job` | Calls `ghx` instead of `gh`. With `auto_merge` off, an approved job is synced, gated, marked ready and left for a person to merge. |
 | `factory/config.json` | New keys `github_transport` (`rest`) and `auto_merge` (`false`). `concurrency` is 1. |
 | `.claude/agents/builder.md`, `.claude/skills/factory/SKILL.md`, `.claude/agents/approver.md` | Use `factory/bin/ghx`; describe the no-merge ending. |
